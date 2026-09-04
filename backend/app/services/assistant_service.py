@@ -40,6 +40,10 @@ class SessionNotFoundError(Exception):
     """Requested session does not exist or belongs to a different user."""
 
 
+class AssistantServiceUnavailableError(RuntimeError):
+    """The graph completed with a safe, user-facing AI service failure."""
+
+
 async def _get_or_create_session(
     db: AsyncSession,
     user: User,
@@ -141,14 +145,21 @@ async def send_message(
         )
     except Exception:
         logger.exception("Unexpected graph error for user_id=%s", user.id)
-        final_state = {
-            "messages": messages + [
-                AIMessage(content="An unexpected error occurred. Please try again.")
-            ]
-        }
+        raise AssistantServiceUnavailableError(
+            "The AI service is temporarily unavailable. Please try again in a moment."
+        ) from None
 
     # 5. Extract assistant reply
     assistant_reply = await _extract_final_response(final_state)
+
+    # agent_node deliberately converts Groq exceptions to safe AIMessage content
+    # so the graph can end cleanly.  Do not serialize that fallback as a normal
+    # assistant reply: callers must receive a non-2xx response and run their
+    # error handling.  A retry that succeeds has error=None and follows the
+    # normal success path below.
+    if final_state.get("error") not in (None, "max_iterations_reached"):
+        logger.warning("AI graph completed with an error for user_id=%s", user.id)
+        raise AssistantServiceUnavailableError(assistant_reply)
 
     # 6. Persist both messages
     now = datetime.now(timezone.utc)

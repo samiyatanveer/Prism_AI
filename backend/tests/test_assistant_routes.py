@@ -10,9 +10,18 @@ Verifies:
 
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
+from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import ValidationError
 
+from app.api.routes import assistant as assistant_routes
+from app.database import get_db
+from app.dependencies import get_current_user
+from app.main import create_app
 from app.schemas.assistant import (
     ChatMessageResponse,
     ChatRequest,
@@ -20,6 +29,7 @@ from app.schemas.assistant import (
     ChatSessionDetail,
     ChatSessionSummary,
 )
+from app.services.assistant_service import _extract_final_response
 
 
 class TestAssistantSchemas:
@@ -105,3 +115,86 @@ class TestAssistantServiceSecurity:
             fields = set(schema.model_fields.keys())
             overlap = fields & forbidden_fields
             assert not overlap, f"Forbidden fields {overlap} found in {schema.__name__}"
+
+
+class TestAssistantChatRoute:
+    def test_successful_chat_returns_the_assistant_response_shape(self, monkeypatch):
+        session_id = uuid.uuid4()
+        created_at = datetime.now(timezone.utc)
+        send_message = AsyncMock(
+            return_value={
+                "session_id": session_id,
+                "message": "BTC is trading above your selected threshold.",
+                "role": "assistant",
+                "created_at": created_at,
+            }
+        )
+        monkeypatch.setattr(assistant_routes.svc, "send_message", send_message)
+
+        async def override_current_user():
+            return SimpleNamespace(id=uuid.uuid4())
+
+        async def override_get_db():
+            yield SimpleNamespace()
+
+        app = create_app()
+        app.dependency_overrides[get_current_user] = override_current_user
+        app.dependency_overrides[get_db] = override_get_db
+
+        response = TestClient(app).post(
+            "/assistant/chat",
+            json={"message": "How is BTC doing?", "session_id": None},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "session_id": str(session_id),
+            "message": "BTC is trading above your selected threshold.",
+            "role": "assistant",
+            "created_at": created_at.isoformat().replace("+00:00", "Z"),
+        }
+        send_message.assert_awaited_once()
+
+    def test_groq_failure_is_an_http_error_not_an_assistant_message(self, monkeypatch):
+        monkeypatch.setattr(
+            assistant_routes.svc,
+            "send_message",
+            AsyncMock(
+                side_effect=assistant_routes.svc.AssistantServiceUnavailableError(
+                    "A network error occurred reaching the AI service. Please try again in a moment."
+                )
+            ),
+        )
+
+        async def override_current_user():
+            return SimpleNamespace(id=uuid.uuid4())
+
+        async def override_get_db():
+            yield SimpleNamespace()
+
+        app = create_app()
+        app.dependency_overrides[get_current_user] = override_current_user
+        app.dependency_overrides[get_db] = override_get_db
+
+        response = TestClient(app).post(
+            "/assistant/chat",
+            json={"message": "How is BTC doing?", "session_id": None},
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": "A network error occurred reaching the AI service. Please try again in a moment."
+        }
+
+    @pytest.mark.asyncio
+    async def test_graph_success_is_extracted_as_the_assistant_message(self):
+        response = await _extract_final_response(
+            {
+                "messages": [
+                    HumanMessage(content="How is BTC doing?"),
+                    AIMessage(content="BTC is trading above your selected threshold."),
+                ]
+            }
+        )
+
+        assert response == "BTC is trading above your selected threshold."
