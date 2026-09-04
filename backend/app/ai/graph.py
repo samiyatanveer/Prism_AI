@@ -18,6 +18,7 @@ Security guarantees:
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -28,6 +29,9 @@ from app.ai.prompts import SYSTEM_PROMPT
 from app.ai.state import AgentState
 from app.ai.tools import ALL_TOOLS
 from app.config import get_settings
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 _MAX_ITERATIONS = 5
 _GRACEFUL_LIMIT_MSG = (
@@ -39,6 +43,42 @@ _GRACEFUL_LIMIT_MSG = (
 # Backoff durations before a single automatic retry.
 _RETRY_BACKOFF_TRANSIENT = 2.0   # seconds — for timeout / connection errors
 _RETRY_BACKOFF_RATE_LIMIT = 12.0  # seconds — for 429 rate-limit errors
+
+
+_GROQ_KEY_PATTERN = re.compile(r"gsk_[A-Za-z0-9_-]+")
+_BEARER_TOKEN_PATTERN = re.compile(r"(?i)(bearer\s+)[^\s,;]+")
+_API_KEY_QUERY_PATTERN = re.compile(r"(?i)(api[_-]?key=)[^\s,&]+")
+
+
+def _safe_exception_details(exc: Exception) -> tuple[str, int | None, str]:
+    """Return diagnostic-only exception details with credentials removed."""
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    if not isinstance(status_code, int):
+        status_code = None
+
+    message = str(exc).replace("\n", " ").replace("\r", " ")
+    message = _GROQ_KEY_PATTERN.sub("[REDACTED]", message)
+    message = _BEARER_TOKEN_PATTERN.sub(r"\1[REDACTED]", message)
+    message = _API_KEY_QUERY_PATTERN.sub(r"\1[REDACTED]", message)
+    return type(exc).__name__, status_code, message[:500]
+
+
+def _log_groq_failure(exc: Exception, *, attempt: int, retryable: bool) -> None:
+    """Log a production-safe Groq/LangChain failure for diagnosis."""
+    error_type, status_code, error_message = _safe_exception_details(exc)
+    logger.warning(
+        "Groq invocation failed",
+        extra={
+            "error_type": error_type,
+            "status_code": status_code,
+            "error_message": error_message,
+            "attempt": attempt,
+            "retryable": retryable,
+        },
+    )
 
 
 def _classify_groq_error(exc: Exception) -> tuple[bool, str, float]:
@@ -118,7 +158,16 @@ def _get_llm():
             timeout=settings.groq_timeout,
         )
         return llm.bind_tools(ALL_TOOLS)
-    except Exception:
+    except Exception as exc:
+        error_type, status_code, error_message = _safe_exception_details(exc)
+        logger.warning(
+            "Groq model initialization failed",
+            extra={
+                "error_type": error_type,
+                "status_code": status_code,
+                "error_message": error_message,
+            },
+        )
         # Do not re-raise the original exception — it may contain the API key
         raise RuntimeError("Failed to initialize AI model. Please try again later.") from None
 
@@ -157,6 +206,10 @@ async def agent_node(state: AgentState) -> dict:
     except RuntimeError as exc:
         # Config error (no API key) or model init failure — not retryable.
         error_msg = str(exc)
+        logger.warning(
+            "Groq model unavailable before invocation",
+            extra={"error_type": type(exc).__name__, "error_message": error_msg},
+        )
         return {
             "messages": [AIMessage(content=error_msg)],
             "error": error_msg,
@@ -165,6 +218,7 @@ async def agent_node(state: AgentState) -> dict:
     except Exception as exc:
         # Classify the Groq / HTTP error without leaking the API key.
         is_retryable, error_msg, retry_delay = _classify_groq_error(exc)
+        _log_groq_failure(exc, attempt=1, retryable=is_retryable)
 
         if is_retryable:
             # One automatic retry after an error-class-specific backoff.
@@ -180,6 +234,7 @@ async def agent_node(state: AgentState) -> dict:
                 }
             except Exception as retry_exc:
                 _, error_msg, _ = _classify_groq_error(retry_exc)
+                _log_groq_failure(retry_exc, attempt=2, retryable=False)
 
         return {
             "messages": [AIMessage(content=error_msg)],

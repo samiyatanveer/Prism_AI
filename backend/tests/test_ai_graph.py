@@ -106,6 +106,41 @@ class TestAIGraph:
             assert "Groq internal server error" not in res["messages"][0].content
 
     @pytest.mark.asyncio
+    async def test_agent_node_logs_sanitized_groq_failure(self, mocker):
+        class RateLimitFailure(Exception):
+            status_code = 429
+
+        state: AgentState = {
+            "messages": [HumanMessage(content="Hello")],
+            "user_id": "test-user-id",
+            "db": None,
+            "error": None,
+            "iteration_count": 0,
+        }
+        failure = RateLimitFailure("429 gsk_this-must-never-appear")
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(side_effect=[failure, failure])
+        log_warning = mocker.patch("app.ai.graph.logger.warning")
+
+        with patch("app.ai.graph._get_llm", return_value=mock_llm), patch(
+            "app.ai.graph.asyncio.sleep", new=AsyncMock()
+        ):
+            result = await agent_node(state)
+
+        assert "rate-limited" in result["messages"][0].content
+        groq_logs = [
+            call for call in log_warning.call_args_list if call.args[0] == "Groq invocation failed"
+        ]
+        assert len(groq_logs) == 2
+        assert groq_logs[0].kwargs["extra"] == {
+            "error_type": "RateLimitFailure",
+            "status_code": 429,
+            "error_message": "429 [REDACTED]",
+            "attempt": 1,
+            "retryable": True,
+        }
+
+    @pytest.mark.asyncio
     async def test_full_graph_invocation_direct_reply(self):
         """Test full graph compiled flow with mocked LLM returning a direct answer."""
         graph = build_graph()
