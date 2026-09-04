@@ -1,0 +1,36 @@
+# ============================================================
+# Core dependencies
+# ============================================================
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+pydantic-settings==2.7.0
+email-validator==2.2.0
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
+
+# Redis
+redis==5.2.1
+
+# HTTP client (for future exchange / market-data calls)
+httpx==0.28.1
+
+# Encryption (exchange credential storage)
+cryptography==44.0.0
+
+# Utilities
+python-multipart==0.0.20
+python-json-logger==3.2.1
+
+# AI Orchestration (LangGraph + Groq)
+langgraph>=1.2.0
+langchain-groq>=1.1.0
+langchain-core>=1.6.0

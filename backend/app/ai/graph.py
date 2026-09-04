@@ -1,0 +1,247 @@
+"""
+LangGraph ReAct agent graph for PrismAI assistant.
+
+Architecture:
+  [agent_node] ← ChatGroq with bound tools
+       ↓ tool_calls present?
+  [tool_node]  ← executes tools with user_id + db in config
+       ↑_______↓  (loop back to agent)
+       ↓ no tool_calls or max_iterations reached
+     [END]
+
+Security guarantees:
+  - user_id and db never appear in LLM messages
+  - Groq API key never logged or raised in exceptions
+  - Max 5 tool-call iterations; graceful message on limit reached
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Literal
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.graph import END, StateGraph
+from langgraph.prebuilt import ToolNode
+
+from app.ai.prompts import SYSTEM_PROMPT
+from app.ai.state import AgentState
+from app.ai.tools import ALL_TOOLS
+from app.config import get_settings
+
+_MAX_ITERATIONS = 5
+_GRACEFUL_LIMIT_MSG = (
+    "I've performed several lookups but couldn't produce a complete answer "
+    "within the allowed steps. Please try rephrasing your question or asking "
+    "about one specific thing at a time."
+)
+
+# Backoff durations before a single automatic retry.
+_RETRY_BACKOFF_TRANSIENT = 2.0   # seconds — for timeout / connection errors
+_RETRY_BACKOFF_RATE_LIMIT = 12.0  # seconds — for 429 rate-limit errors
+
+
+def _classify_groq_error(exc: Exception) -> tuple[bool, str, float]:
+    """
+    Classify a Groq / HTTP exception without leaking credential material.
+
+    Returns (is_retryable, user_message, retry_delay_secs).
+      - is_retryable: True when a single delayed retry is worth attempting.
+      - user_message: A safe, specific string to surface if the error persists.
+      - retry_delay_secs: How long to wait before the retry attempt.
+    """
+    name = type(exc).__name__
+    msg = str(exc)
+
+    # Groq SDK raises groq.RateLimitError (HTTP 429).
+    # Retry once after a longer pause; the token bucket usually resets within 10 s.
+    if "RateLimit" in name or "rate_limit" in msg.lower() or "429" in msg:
+        return True, (
+            "The AI service is rate-limited. Please wait a moment and try again."
+        ), _RETRY_BACKOFF_RATE_LIMIT
+
+    # HTTP 400: request payload too large (context overflow) or malformed tool call.
+    # Not retryable — retrying the same payload will fail again.
+    if "BadRequest" in name or "400" in msg:
+        return False, (
+            "Your request produced too much context for the AI to process in one go. "
+            "Try asking about a specific asset or a smaller question."
+        ), 0.0
+
+    # groq.AuthenticationError (HTTP 401) — config problem, not transient.
+    if "Authentication" in name or "401" in msg:
+        return False, "AI assistant configuration error. Please contact support.", 0.0
+
+    # groq.NotFoundError (HTTP 404) — model unavailable / removed.
+    if "NotFound" in name or "404" in msg:
+        return False, "The configured AI model is unavailable. Please contact support.", 0.0
+
+    # groq.APITimeoutError / httpx.ReadTimeout / asyncio.TimeoutError — retryable.
+    if (
+        "Timeout" in name
+        or "timeout" in msg.lower()
+        or isinstance(exc, asyncio.TimeoutError)
+    ):
+        return True, (
+            "The AI service did not respond in time. "
+            "Please try again — your question has been noted."
+        ), _RETRY_BACKOFF_TRANSIENT
+
+    # groq.APIConnectionError / httpx network errors — retryable.
+    if "Connection" in name or "connect" in msg.lower():
+        return True, (
+            "A network error occurred reaching the AI service. "
+            "Please try again in a moment."
+        ), _RETRY_BACKOFF_TRANSIENT
+
+    # Fallback: unknown error, likely transient.
+    return True, "The AI service is temporarily unavailable. Please try again in a moment.", _RETRY_BACKOFF_TRANSIENT
+
+
+def _get_llm():
+    """
+    Instantiate ChatGroq. Called lazily so the app starts without GROQ_API_KEY.
+    Raises RuntimeError (not ValueError) so the API layer can return 503.
+    GROQ_API_KEY is never logged.
+    """
+    settings = get_settings()
+    if not settings.groq_api_key:
+        raise RuntimeError(
+            "AI assistant is not configured. "
+            "Set the GROQ_API_KEY environment variable to enable it."
+        )
+    try:
+        from langchain_groq import ChatGroq
+        llm = ChatGroq(
+            model=settings.groq_model,
+            api_key=settings.groq_api_key,   # passed directly; never logged
+            timeout=settings.groq_timeout,
+        )
+        return llm.bind_tools(ALL_TOOLS)
+    except Exception:
+        # Do not re-raise the original exception — it may contain the API key
+        raise RuntimeError("Failed to initialize AI model. Please try again later.") from None
+
+
+# ── Nodes ─────────────────────────────────────────────────────────────────────
+
+async def agent_node(state: AgentState) -> dict:
+    """
+    Call the Groq LLM with the current message history.
+    Injects the system prompt as the first message if not already present.
+    Enforces max iteration limit.
+    """
+    # Check iteration limit before calling LLM
+    iteration = state.get("iteration_count", 0)
+    if iteration >= _MAX_ITERATIONS:
+        return {
+            "messages": [AIMessage(content=_GRACEFUL_LIMIT_MSG)],
+            "error": "max_iterations_reached",
+            "iteration_count": iteration,
+        }
+
+    messages = list(state["messages"])
+
+    # Prepend system prompt if the conversation doesn't have one yet
+    if not messages or not isinstance(messages[0], SystemMessage):
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+
+    try:
+        llm = _get_llm()
+        response = await llm.ainvoke(messages)
+        return {
+            "messages": [response],
+            "error": None,
+            "iteration_count": iteration + 1,
+        }
+    except RuntimeError as exc:
+        # Config error (no API key) or model init failure — not retryable.
+        error_msg = str(exc)
+        return {
+            "messages": [AIMessage(content=error_msg)],
+            "error": error_msg,
+            "iteration_count": iteration,
+        }
+    except Exception as exc:
+        # Classify the Groq / HTTP error without leaking the API key.
+        is_retryable, error_msg, retry_delay = _classify_groq_error(exc)
+
+        if is_retryable:
+            # One automatic retry after an error-class-specific backoff.
+            # Rate limits use a longer pause; transient errors use a short one.
+            await asyncio.sleep(retry_delay)
+            try:
+                llm = _get_llm()
+                response = await llm.ainvoke(messages)
+                return {
+                    "messages": [response],
+                    "error": None,
+                    "iteration_count": iteration + 1,
+                }
+            except Exception as retry_exc:
+                _, error_msg, _ = _classify_groq_error(retry_exc)
+
+        return {
+            "messages": [AIMessage(content=error_msg)],
+            "error": error_msg,
+            "iteration_count": iteration,
+        }
+
+
+def should_continue(state: AgentState) -> Literal["tools", END]:
+    """
+    Route decision: call tools or end the graph.
+    Stop if: error set, max iterations, or last message has no tool calls.
+    """
+    if state.get("error"):
+        return END
+
+    messages = state["messages"]
+    last_message = messages[-1] if messages else None
+
+    if not isinstance(last_message, AIMessage):
+        return END
+
+    if not getattr(last_message, "tool_calls", None):
+        return END
+
+    if state.get("iteration_count", 0) >= _MAX_ITERATIONS:
+        return END
+
+    return "tools"
+
+
+def build_graph() -> StateGraph:
+    """
+    Construct and compile the PrismAI LangGraph ReAct graph.
+
+    The ToolNode executes tools with the user_id and db passed via config
+    (RunnableConfig) — these values come from the graph invocation call,
+    not from the LLM.
+    """
+    tool_node = ToolNode(ALL_TOOLS)
+
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tool_node)
+
+    builder.set_entry_point("agent")
+    builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    builder.add_edge("tools", "agent")
+
+    return builder.compile()
+
+
+# Lazily compiled graph — compiled once on first use
+_graph = None
+_graph_lock = asyncio.Lock()
+
+
+async def get_graph():
+    """Return the compiled graph, compiling it on first call."""
+    global _graph
+    if _graph is None:
+        async with _graph_lock:
+            if _graph is None:
+                _graph = build_graph()
+    return _graph

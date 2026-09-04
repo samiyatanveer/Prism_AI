@@ -1,0 +1,54 @@
+# PrismAI — Local Development Infrastructure
+#
+# Provides PostgreSQL and Redis for local development only.
+# The FastAPI backend and Next.js frontend run directly on the host:
+#
+#   Backend:  cd backend && uvicorn app.main:app --reload
+#   Frontend: cd frontend && npm run dev
+#
+# Usage:
+#   docker compose up -d         # start infrastructure
+#   docker compose down          # stop
+#   docker compose down -v       # stop and wipe data volumes
+#
+# Copy .env.example to .env and fill in values before running.
+
+services:
+  # ──────────────────────────────────────────────────────────
+  # PostgreSQL 16
+  # ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: prism_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-prism_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-prism_ai}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prism_user} -d ${POSTGRES_DB:-prism_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────
+  # Redis 7
+  # ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: prism_redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
