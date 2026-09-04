@@ -18,7 +18,9 @@ Security guarantees:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import socket
 from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -66,12 +68,58 @@ def _safe_exception_details(exc: Exception) -> tuple[str, int | None, str]:
     return type(exc).__name__, status_code, message[:500]
 
 
+def _safe_transport_details(exc: Exception) -> tuple[str, str]:
+    """Classify and summarize the exception chain behind an SDK connection error."""
+    chain: list[Exception] = []
+    current: Exception | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(chain) < 5:
+        chain.append(current)
+        seen.add(id(current))
+        cause = current.__cause__ or current.__context__
+        current = cause if isinstance(cause, Exception) else None
+
+    type_names = {type(item).__name__.lower() for item in chain}
+    details = " ".join(str(item).lower() for item in chain)
+    if any(isinstance(item, socket.gaierror) for item in chain) or any(
+        marker in details
+        for marker in ("getaddrinfo", "name or service not known", "temporary failure in name resolution")
+    ):
+        transport = "dns"
+    elif "proxyerror" in type_names or "proxy" in details:
+        transport = "proxy"
+    elif any("ssl" in name for name in type_names) or any(
+        marker in details for marker in ("tls", "certificate verify", "ssl")
+    ):
+        transport = "tls"
+    elif any("timeout" in name for name in type_names) or "timed out" in details:
+        transport = "timeout"
+    elif any("connectionrefused" in name for name in type_names) or "connection refused" in details:
+        transport = "connection_refused"
+    elif any("connect" in name for name in type_names):
+        transport = "connection"
+    else:
+        transport = "unknown"
+
+    parts = []
+    for item in chain:
+        _, _, message = _safe_exception_details(item)
+        parts.append(f"{type(item).__name__}: {message or '[no message]'}")
+    return transport, " <- ".join(parts)
+
+
 def _log_groq_failure(exc: Exception, *, attempt: int, retryable: bool) -> None:
     """Log a production-safe Groq/LangChain failure for diagnosis."""
     error_type, status_code, error_message = _safe_exception_details(exc)
+    transport, cause_chain = _safe_transport_details(exc)
+    https_proxy_set = bool(os.getenv("HTTPS_PROXY") or os.getenv("https_proxy"))
+    http_proxy_set = bool(os.getenv("HTTP_PROXY") or os.getenv("http_proxy"))
+    no_proxy_set = bool(os.getenv("NO_PROXY") or os.getenv("no_proxy"))
     logger.warning(
         f"Groq invocation failed: type={error_type}, status={status_code}, "
-        f"error={error_message}, attempt={attempt}, retryable={retryable}"
+        f"error={error_message}, transport={transport}, causes={cause_chain}, "
+        f"https_proxy_set={https_proxy_set}, http_proxy_set={http_proxy_set}, "
+        f"no_proxy_set={no_proxy_set}, attempt={attempt}, retryable={retryable}"
     )
 
 

@@ -9,6 +9,7 @@ Verifies:
 """
 
 import pytest
+import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -106,7 +107,7 @@ class TestAIGraph:
             assert "Groq internal server error" not in res["messages"][0].content
 
     @pytest.mark.asyncio
-    async def test_agent_node_logs_sanitized_groq_failure(self, mocker):
+    async def test_agent_node_logs_sanitized_groq_failure(self, mocker, monkeypatch):
         class RateLimitFailure(Exception):
             status_code = 429
 
@@ -121,6 +122,8 @@ class TestAIGraph:
         mock_llm = MagicMock()
         mock_llm.ainvoke = AsyncMock(side_effect=[failure, failure])
         log_warning = mocker.patch("app.ai.graph.logger.warning")
+        for variable in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(variable, raising=False)
 
         with patch("app.ai.graph._get_llm", return_value=mock_llm), patch(
             "app.ai.graph.asyncio.sleep", new=AsyncMock()
@@ -136,9 +139,27 @@ class TestAIGraph:
         assert len(groq_logs) == 2
         assert groq_logs[0].args[0] == (
             "Groq invocation failed: type=RateLimitFailure, status=429, "
-            "error=429 [REDACTED], attempt=1, retryable=True"
+            "error=429 [REDACTED], transport=unknown, "
+            "causes=RateLimitFailure: 429 [REDACTED], "
+            "https_proxy_set=False, http_proxy_set=False, no_proxy_set=False, "
+            "attempt=1, retryable=True"
         )
         assert "gsk_this-must-never-appear" not in groq_logs[0].args[0]
+
+    def test_transport_diagnostic_identifies_and_sanitizes_dns_cause(self):
+        from app.ai.graph import _safe_transport_details
+
+        outer = Exception("Connection error")
+        outer.__cause__ = socket.gaierror(
+            -3, "Temporary failure in name resolution for gsk_never-log-this"
+        )
+
+        transport, causes = _safe_transport_details(outer)
+
+        assert transport == "dns"
+        assert "gaierror" in causes
+        assert "gsk_never-log-this" not in causes
+        assert "[REDACTED]" in causes
 
     @pytest.mark.asyncio
     async def test_full_graph_invocation_direct_reply(self):
