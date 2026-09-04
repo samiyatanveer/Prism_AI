@@ -41,6 +41,9 @@ target_metadata = Base.metadata
 from app.config import get_settings  # noqa: E402
 
 _settings = get_settings()
+# Settings normalizes Railway's postgres[ql]:// URL to the asyncpg URL used by
+# both the app engine and this migration engine. Keep Alembic on that same
+# driver so it never falls back to an unavailable synchronous psycopg driver.
 config.set_main_option("sqlalchemy.url", _settings.database_url)
 
 

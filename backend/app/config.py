@@ -13,6 +13,26 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def normalize_database_url(value: str) -> str:
+    """Return a PostgreSQL URL compatible with PrismAI's asyncpg engine.
+
+    Railway exposes ``DATABASE_URL`` using the standard ``postgresql://``
+    (or legacy ``postgres://``) scheme. SQLAlchemy treats that as the
+    synchronous psycopg2 dialect unless a driver is specified, which is not
+    installed and is incompatible with this application's async engine.
+    Explicit PostgreSQL driver URLs are normalized too: this backend has one
+    supported database driver, asyncpg.
+    """
+    normalized = value.strip()
+    if "://" not in normalized:
+        return normalized
+
+    scheme, remainder = normalized.split("://", 1)
+    if scheme in {"postgres", "postgresql"} or scheme.startswith("postgresql+"):
+        return f"postgresql+asyncpg://{remainder}"
+    return normalized
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         # Resolve relative to the backend package so launching Uvicorn from
@@ -62,6 +82,11 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [o.strip() for o in v.split(",")]
         return v
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_async_database_url(cls, value: str) -> str:
+        return normalize_database_url(value)
 
     @field_validator("encryption_key")
     @classmethod
