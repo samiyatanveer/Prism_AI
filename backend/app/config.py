@@ -7,10 +7,13 @@ when required variables are missing.
 """
 
 import base64
+import json
 from functools import lru_cache
 from pathlib import Path
-from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated
+
+from pydantic import AliasChoices, Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def normalize_database_url(value: str) -> str:
@@ -72,7 +75,13 @@ class Settings(BaseSettings):
     groq_model: str = "openai/gpt-oss-20b"
     groq_timeout: float = 30.0  # seconds per LLM call
 
-    allowed_origins: list[str] = ["http://localhost:3000"]
+    # Railway should use CORS_ORIGINS. Keep ALLOWED_ORIGINS as a compatibility
+    # alias for existing local environments. NoDecode lets the validator accept
+    # either a comma-separated value or a JSON array.
+    allowed_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:3000"],
+        validation_alias=AliasChoices("CORS_ORIGINS", "ALLOWED_ORIGINS"),
+    )
     # ── Binance ─────────────────────────────────────────────────
     binance_base_url: str = "https://api.binance.com"
 
@@ -80,7 +89,13 @@ class Settings(BaseSettings):
     @classmethod
     def parse_origins(cls, v):
         if isinstance(v, str):
-            return [o.strip() for o in v.split(",")]
+            value = v.strip()
+            if value.startswith("["):
+                v = json.loads(value)
+            else:
+                v = value.split(",")
+        if isinstance(v, list):
+            return [origin.strip() for origin in v if origin.strip()]
         return v
 
     @field_validator("database_url", mode="before")
