@@ -70,14 +70,8 @@ def _log_groq_failure(exc: Exception, *, attempt: int, retryable: bool) -> None:
     """Log a production-safe Groq/LangChain failure for diagnosis."""
     error_type, status_code, error_message = _safe_exception_details(exc)
     logger.warning(
-        "Groq invocation failed",
-        extra={
-            "error_type": error_type,
-            "status_code": status_code,
-            "error_message": error_message,
-            "attempt": attempt,
-            "retryable": retryable,
-        },
+        f"Groq invocation failed: type={error_type}, status={status_code}, "
+        f"error={error_message}, attempt={attempt}, retryable={retryable}"
     )
 
 
@@ -161,12 +155,8 @@ def _get_llm():
     except Exception as exc:
         error_type, status_code, error_message = _safe_exception_details(exc)
         logger.warning(
-            "Groq model initialization failed",
-            extra={
-                "error_type": error_type,
-                "status_code": status_code,
-                "error_message": error_message,
-            },
+            f"Groq model initialization failed: type={error_type}, "
+            f"status={status_code}, error={error_message}"
         )
         # Do not re-raise the original exception — it may contain the API key
         raise RuntimeError("Failed to initialize AI model. Please try again later.") from None
@@ -207,8 +197,8 @@ async def agent_node(state: AgentState) -> dict:
         # Config error (no API key) or model init failure — not retryable.
         error_msg = str(exc)
         logger.warning(
-            "Groq model unavailable before invocation",
-            extra={"error_type": type(exc).__name__, "error_message": error_msg},
+            f"Groq model unavailable before invocation: type={type(exc).__name__}, "
+            f"error={error_msg}"
         )
         return {
             "messages": [AIMessage(content=error_msg)],

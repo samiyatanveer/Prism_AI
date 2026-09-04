@@ -129,16 +129,16 @@ class TestAIGraph:
 
         assert "rate-limited" in result["messages"][0].content
         groq_logs = [
-            call for call in log_warning.call_args_list if call.args[0] == "Groq invocation failed"
+            call
+            for call in log_warning.call_args_list
+            if call.args[0].startswith("Groq invocation failed:")
         ]
         assert len(groq_logs) == 2
-        assert groq_logs[0].kwargs["extra"] == {
-            "error_type": "RateLimitFailure",
-            "status_code": 429,
-            "error_message": "429 [REDACTED]",
-            "attempt": 1,
-            "retryable": True,
-        }
+        assert groq_logs[0].args[0] == (
+            "Groq invocation failed: type=RateLimitFailure, status=429, "
+            "error=429 [REDACTED], attempt=1, retryable=True"
+        )
+        assert "gsk_this-must-never-appear" not in groq_logs[0].args[0]
 
     @pytest.mark.asyncio
     async def test_full_graph_invocation_direct_reply(self):
